@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <thread>
 
 ssize_t write_all(int fd, const char* buf, size_t count) 
 {
@@ -46,7 +47,7 @@ int main() {
     printf( "Server listening on port 8080\n");
     fflush(stdout);
 
-    char buffer[1024];
+    //char buffer[1024];
 
 //int accept(int sockfd, struct sockaddr *_Nullable restrict addr,
 	//socklen_t *_Nullable restrict addrlen);
@@ -62,18 +63,21 @@ int main() {
         printf("Client connected\n");
         fflush(stdout);
 
-        while(true)
-        {
-            ssize_t n = read(new_fd, buffer, 1024);
-            fprintf(stderr, "read returned %zd\n", n);  
-            if (n <= 0) break;
-            fprintf(stderr, "echoing: %.*s\n", (int)n, buffer); 
-            write_all(new_fd, buffer, n);
-        }
+
+        std::thread t1([new_fd](){
+            char buffer[1024];
+            while(true){
+                ssize_t n = read(new_fd, buffer, 1024);
+                if (n <= 0) return;
+                write_all(new_fd, buffer, n);
+            }
+            close(new_fd);
+            printf("Client disconnected\n");
+        });
+        t1.detach();
 
 
-        close(new_fd);
-        printf("Client disconnected\n");
+
         fflush(stdout);
 
     }
