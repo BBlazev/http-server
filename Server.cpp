@@ -1,4 +1,5 @@
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,7 +9,9 @@
 #include <unistd.h>
 #include <thread>
 
-#include "ThreadPool.hpp"
+//#include "ThreadPool.hpp"
+
+
 
 ssize_t write_all(int fd, const char* buf, size_t count)
 {
@@ -38,8 +41,109 @@ const char* mime_type(const std::string& path)
     return "application/octet-stream";
 }
 
+
+void handle_client(int fd, int epfd)
+{
+        char buffer[8192];
+        size_t total = 0;
+            // read until \r\n\r\n
+        while (true) {
+            ssize_t n = read(fd, buffer + total, sizeof(buffer) - total);
+            if (n <= 0) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                close(fd);
+                return;
+            }
+            total += n;
+
+            if (memmem(buffer, total, "\r\n\r\n", 4)) break;
+
+            // headers too big
+            if (total >= sizeof(buffer)) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                close(fd);
+                return;
+            }
+        }
+
+        // extract method
+        char* method_end = (char*)memchr(buffer, ' ', total);
+        if (!method_end) {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            return;
+        }
+        size_t method_len = method_end - buffer;
+        if (!(method_len == 3 && memcmp(buffer, "GET", 3) == 0)) {
+            const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
+            write_all(fd, resp, strlen(resp));
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            return;
+        }
+
+        // extract path
+        char* path_start = method_end + 1;
+        size_t remaining = total - (path_start - buffer);
+        char* path_end = (char*)memchr(path_start, ' ', remaining);
+        if (!path_end) {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            return;
+        }
+        std::string path(path_start, path_end);
+
+        // path traversal check
+        if (path.find("..") != std::string::npos) {
+            const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
+            write_all(fd, resp, strlen(resp));
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            return;
+        }
+
+        std::string local_path = (path == "/") ? "./index.html" : "." + path;
+
+        std::ifstream file(local_path, std::ios::binary);
+        if (!file.is_open()) {
+            printf("File not found: %s\n", local_path.c_str());
+            fflush(stdout);
+            const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
+            write_all(fd, not_found, strlen(not_found));
+            
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            return;
+        }
+
+        file.seekg(0, std::ios::end);
+        std::streamsize file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << mime_type(local_path) << "\r\n"
+            << "Content-Length: " << file_size << "\r\n"
+            << "\r\n";
+        std::string headers = hdr.str();
+        write_all(fd, headers.data(), headers.size());
+
+        char file_buffer[8192];
+        while (file) {
+            file.read(file_buffer, sizeof(file_buffer));
+            std::streamsize got = file.gcount();
+            if (got > 0) write_all(fd, file_buffer, got);
+        }
+
+        printf("Successfully served: %s\n", local_path.c_str());
+        fflush(stdout);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
+}
+
+
 int main() {
-    ThreadPool pool(10);
+    //ThreadPool pool(10);
     int tcp = socket(AF_INET, SOCK_STREAM, 0);
 
     if (tcp < 0) {
@@ -68,202 +172,38 @@ int main() {
     printf("Server listening on port 8080\n");
     fflush(stdout);
 
+    //epoll instance
+    int epfd = epoll_create1(0);
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = tcp;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, tcp, &ev);
+
+    struct epoll_event events[64];
     while (true) {
-        int new_fd = accept(tcp, nullptr, nullptr);
-        if (new_fd < 0) 
+        int n = epoll_wait(epfd, events, 64, -1); //-1 wait forever
+        for(int i = 0; i < n; i++)
         {
-            perror("accept failed");
-            continue;
+            int fd = events[i].data.fd;
+            if (fd == tcp)
+            {
+                //accept new connections
+                int client_fd = accept(tcp, nullptr, nullptr);
+                //register that cliendfd with epoll
+                struct epoll_event cev{};
+                cev.events = EPOLLIN;
+                cev.data.fd = client_fd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
+                
+            }
+            else
+            {
+                handle_client(fd, epfd);
+                // epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                // close(fd);
+            }
         }
-        printf("Client connected\n");
-        fflush(stdout);
-
-        pool.submit([new_fd]() {
-            char buffer[8192];
-            size_t total = 0;
-
-            // read until \r\n\r\n
-            while (true) {
-                ssize_t n = read(new_fd, buffer + total, sizeof(buffer) - total);
-                if (n <= 0) {
-                    close(new_fd);
-                    return;
-                }
-                total += n;
-
-                if (memmem(buffer, total, "\r\n\r\n", 4)) break;
-
-                // headers too big
-                if (total >= sizeof(buffer)) {
-                    close(new_fd);
-                    return;
-                }
-            }
-
-            // extract method
-            char* method_end = (char*)memchr(buffer, ' ', total);
-            if (!method_end) {
-                close(new_fd);
-                return;
-            }
-            size_t method_len = method_end - buffer;
-            if (!(method_len == 3 && memcmp(buffer, "GET", 3) == 0)) {
-                const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
-                write_all(new_fd, resp, strlen(resp));
-                close(new_fd);
-                return;
-            }
-
-            // extract path
-            char* path_start = method_end + 1;
-            size_t remaining = total - (path_start - buffer);
-            char* path_end = (char*)memchr(path_start, ' ', remaining);
-            if (!path_end) {
-                close(new_fd);
-                return;
-            }
-            std::string path(path_start, path_end);
-
-            // path traversal check
-            if (path.find("..") != std::string::npos) {
-                const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
-                write_all(new_fd, resp, strlen(resp));
-                close(new_fd);
-                return;
-            }
-
-            std::string local_path = (path == "/") ? "./index.html" : "." + path;
-
-            std::ifstream file(local_path, std::ios::binary);
-            if (!file.is_open()) {
-                printf("File not found: %s\n", local_path.c_str());
-                fflush(stdout);
-                const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
-                write_all(new_fd, not_found, strlen(not_found));
-                close(new_fd);
-                return;
-            }
-
-            file.seekg(0, std::ios::end);
-            std::streamsize file_size = file.tellg();
-            file.seekg(0, std::ios::beg);
-
-            std::ostringstream hdr;
-            hdr << "HTTP/1.1 200 OK\r\n"
-                << "Content-Type: " << mime_type(local_path) << "\r\n"
-                << "Content-Length: " << file_size << "\r\n"
-                << "\r\n";
-            std::string headers = hdr.str();
-            write_all(new_fd, headers.data(), headers.size());
-
-            char file_buffer[8192];
-            while (file) {
-                file.read(file_buffer, sizeof(file_buffer));
-                std::streamsize got = file.gcount();
-                if (got > 0) write_all(new_fd, file_buffer, got);
-            }
-
-            printf("Successfully served: %s\n", local_path.c_str());
-            fflush(stdout);
-
-            file.close();
-            close(new_fd);
-        });
-        
-
-        // std::thread t1([new_fd]() {
-        //     char buffer[8192];
-        //     size_t total = 0;
-
-        //     // read until \r\n\r\n
-        //     while (true) {
-        //         ssize_t n = read(new_fd, buffer + total, sizeof(buffer) - total);
-        //         if (n <= 0) {
-        //             close(new_fd);
-        //             return;
-        //         }
-        //         total += n;
-
-        //         if (memmem(buffer, total, "\r\n\r\n", 4)) break;
-
-        //         // headers too big
-        //         if (total >= sizeof(buffer)) {
-        //             close(new_fd);
-        //             return;
-        //         }
-        //     }
-
-        //     // extract method
-        //     char* method_end = (char*)memchr(buffer, ' ', total);
-        //     if (!method_end) {
-        //         close(new_fd);
-        //         return;
-        //     }
-        //     size_t method_len = method_end - buffer;
-        //     if (!(method_len == 3 && memcmp(buffer, "GET", 3) == 0)) {
-        //         const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
-        //         write_all(new_fd, resp, strlen(resp));
-        //         close(new_fd);
-        //         return;
-        //     }
-
-        //     // extract path
-        //     char* path_start = method_end + 1;
-        //     size_t remaining = total - (path_start - buffer);
-        //     char* path_end = (char*)memchr(path_start, ' ', remaining);
-        //     if (!path_end) {
-        //         close(new_fd);
-        //         return;
-        //     }
-        //     std::string path(path_start, path_end);
-
-        //     // path traversal check
-        //     if (path.find("..") != std::string::npos) {
-        //         const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
-        //         write_all(new_fd, resp, strlen(resp));
-        //         close(new_fd);
-        //         return;
-        //     }
-
-        //     std::string local_path = (path == "/") ? "./index.html" : "." + path;
-
-        //     std::ifstream file(local_path, std::ios::binary);
-        //     if (!file.is_open()) {
-        //         printf("File not found: %s\n", local_path.c_str());
-        //         fflush(stdout);
-        //         const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
-        //         write_all(new_fd, not_found, strlen(not_found));
-        //         close(new_fd);
-        //         return;
-        //     }
-
-        //     file.seekg(0, std::ios::end);
-        //     std::streamsize file_size = file.tellg();
-        //     file.seekg(0, std::ios::beg);
-
-        //     std::ostringstream hdr;
-        //     hdr << "HTTP/1.1 200 OK\r\n"
-        //         << "Content-Type: " << mime_type(local_path) << "\r\n"
-        //         << "Content-Length: " << file_size << "\r\n"
-        //         << "\r\n";
-        //     std::string headers = hdr.str();
-        //     write_all(new_fd, headers.data(), headers.size());
-
-        //     char file_buffer[8192];
-        //     while (file) {
-        //         file.read(file_buffer, sizeof(file_buffer));
-        //         std::streamsize got = file.gcount();
-        //         if (got > 0) write_all(new_fd, file_buffer, got);
-        //     }
-
-        //     printf("Successfully served: %s\n", local_path.c_str());
-        //     fflush(stdout);
-
-        //     file.close();
-        //     close(new_fd);
-        // });
-        // t1.detach();
-    }
+    }        
 
     return 0;
 }
