@@ -8,10 +8,20 @@
 #include <sstream>
 #include <unistd.h>
 #include <thread>
-
+#include <vector>
 //#include "ThreadPool.hpp"
 
 
+
+const size_t MAX_HEADERS = 8192;
+
+
+struct Connection
+{
+    int fd;
+    std::vector<char> buffer; //accumulated req bytes
+    bool headers_done = false; // \r\n\r\n yet?
+};
 
 ssize_t write_all(int fd, const char* buf, size_t count)
 {
@@ -42,103 +52,89 @@ const char* mime_type(const std::string& path)
 }
 
 
-void handle_client(int fd, int epfd)
+void handle_client(Connection* conn, int epfd)
 {
-        char buffer[8192];
-        size_t total = 0;
-            // read until \r\n\r\n
-        while (true) {
-            ssize_t n = read(fd, buffer + total, sizeof(buffer) - total);
-            if (n <= 0) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                close(fd);
-                return;
-            }
-            total += n;
+    // extract method
+    char* method_end = (char*)memchr(conn->buffer.data(), ' ', conn->buffer.size());
+    if (!method_end) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        close(conn->fd);
+        delete conn;
+        return;
+    }
+    size_t method_len = method_end - conn->buffer.data();
+    if (!(method_len == 3 && memcmp(conn->buffer.data(), "GET", 3) == 0)) {
+        const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
+        write_all(conn->fd, resp, strlen(resp));
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        close(conn->fd);
+        delete conn;
+        return;
+    }
 
-            if (memmem(buffer, total, "\r\n\r\n", 4)) break;
+    // extract path
+    char* path_start = method_end + 1;
+    size_t remaining = conn->buffer.size() - (path_start - conn->buffer.data());
+    char* path_end = (char*)memchr(path_start, ' ', remaining);
+    if (!path_end) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        close(conn->fd);
+        delete conn;
+        return;
+    }
+    std::string path(path_start, path_end);
 
-            // headers too big
-            if (total >= sizeof(buffer)) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                close(fd);
-                return;
-            }
-        }
+    // path traversal check
+    if (path.find("..") != std::string::npos) {
+        const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
+        write_all(conn->fd, resp, strlen(resp));
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        close(conn->fd);
+        delete conn;
+        return;
+    }
 
-        // extract method
-        char* method_end = (char*)memchr(buffer, ' ', total);
-        if (!method_end) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            return;
-        }
-        size_t method_len = method_end - buffer;
-        if (!(method_len == 3 && memcmp(buffer, "GET", 3) == 0)) {
-            const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
-            write_all(fd, resp, strlen(resp));
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            return;
-        }
+    std::string local_path = (path == "/") ? "./index.html" : "." + path;
 
-        // extract path
-        char* path_start = method_end + 1;
-        size_t remaining = total - (path_start - buffer);
-        char* path_end = (char*)memchr(path_start, ' ', remaining);
-        if (!path_end) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            return;
-        }
-        std::string path(path_start, path_end);
-
-        // path traversal check
-        if (path.find("..") != std::string::npos) {
-            const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
-            write_all(fd, resp, strlen(resp));
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            return;
-        }
-
-        std::string local_path = (path == "/") ? "./index.html" : "." + path;
-
-        std::ifstream file(local_path, std::ios::binary);
-        if (!file.is_open()) {
-            printf("File not found: %s\n", local_path.c_str());
-            fflush(stdout);
-            const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
-            write_all(fd, not_found, strlen(not_found));
-            
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            return;
-        }
-
-        file.seekg(0, std::ios::end);
-        std::streamsize file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::ostringstream hdr;
-        hdr << "HTTP/1.1 200 OK\r\n"
-            << "Content-Type: " << mime_type(local_path) << "\r\n"
-            << "Content-Length: " << file_size << "\r\n"
-            << "\r\n";
-        std::string headers = hdr.str();
-        write_all(fd, headers.data(), headers.size());
-
-        char file_buffer[8192];
-        while (file) {
-            file.read(file_buffer, sizeof(file_buffer));
-            std::streamsize got = file.gcount();
-            if (got > 0) write_all(fd, file_buffer, got);
-        }
-
-        printf("Successfully served: %s\n", local_path.c_str());
+    std::ifstream file(local_path, std::ios::binary);
+    if (!file.is_open()) {
+        printf("File not found: %s\n", local_path.c_str());
         fflush(stdout);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-        close(fd);
+        const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
+        write_all(conn->fd, not_found, strlen(not_found));
+        
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        close(conn->fd);
+        delete conn;
+
+        return;
+    }
+
+    file.seekg(0, std::ios::end);
+    std::streamsize file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 200 OK\r\n"
+        << "Content-Type: " << mime_type(local_path) << "\r\n"
+        << "Content-Length: " << file_size << "\r\n"
+        << "\r\n";
+    std::string headers = hdr.str();
+    write_all(conn->fd, headers.data(), headers.size());
+
+    char file_buffer[8192];
+    while (file) {
+        file.read(file_buffer, sizeof(file_buffer));
+        std::streamsize got = file.gcount();
+        if (got > 0) write_all(conn->fd, file_buffer, got);
+    }
+
+    printf("Successfully served: %s\n", local_path.c_str());
+    fflush(stdout);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+    close(conn->fd);
+    delete conn;
+    return;
 }
 
 
@@ -171,36 +167,78 @@ int main() {
     }
     printf("Server listening on port 8080\n");
     fflush(stdout);
-
+    
     //epoll instance
     int epfd = epoll_create1(0);
     struct epoll_event ev{};
     ev.events = EPOLLIN;
     ev.data.fd = tcp;
+    ev.data.ptr = nullptr;
     epoll_ctl(epfd, EPOLL_CTL_ADD, tcp, &ev);
 
     struct epoll_event events[64];
+
     while (true) {
         int n = epoll_wait(epfd, events, 64, -1); //-1 wait forever
         for(int i = 0; i < n; i++)
         {
-            int fd = events[i].data.fd;
-            if (fd == tcp)
+            //int fd = events[i].data.fd;
+            if (events[i].data.ptr == nullptr)
             {
                 //accept new connections
                 int client_fd = accept(tcp, nullptr, nullptr);
+
+                Connection* conn = new Connection{client_fd};
+
                 //register that cliendfd with epoll
                 struct epoll_event cev{};
                 cev.events = EPOLLIN;
-                cev.data.fd = client_fd;
+                cev.data.ptr = conn;
                 epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
                 
             }
             else
             {
-                handle_client(fd, epfd);
-                // epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                // close(fd);
+                Connection* conn = (Connection*)events[i].data.ptr;
+
+                char temp[4096];
+                ssize_t n = read(conn->fd, temp, sizeof(temp));
+
+                if(n == 0)
+                {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                    close(conn->fd);
+                    delete conn;
+                    continue;
+                }
+                if(n < 0)
+                {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                    close(conn->fd);
+                    delete conn;
+                    continue; 
+                }
+
+                conn->buffer.insert(conn->buffer.end(), temp, temp + n);
+                
+                if (conn->buffer.size() > MAX_HEADERS) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                    close(conn->fd);
+                    delete conn;
+                    continue;
+                }
+
+                if(memmem(conn->buffer.data(), conn->buffer.size(), "\r\n\r\n", 4))
+                {
+                    handle_client(conn, epfd);
+
+                }
+                else
+                {
+                // headers not complete yet, wait for next epoll wakeup
+
+                }
+
             }
         }
     }        
