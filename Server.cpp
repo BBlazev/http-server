@@ -140,7 +140,7 @@ void handle_client(Connection* conn, int epfd)
 
 int main() {
     //ThreadPool pool(10);
-    int tcp = socket(AF_INET, SOCK_STREAM, 0);
+    int tcp = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 
     if (tcp < 0) {
         perror("Error opening socket");
@@ -185,16 +185,21 @@ int main() {
             //int fd = events[i].data.fd;
             if (events[i].data.ptr == nullptr)
             {
-                //accept new connections
-                int client_fd = accept(tcp, nullptr, nullptr);
-
-                Connection* conn = new Connection{client_fd};
-
-                //register that cliendfd with epoll
-                struct epoll_event cev{};
-                cev.events = EPOLLIN;
-                cev.data.ptr = conn;
-                epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
+                while(true)
+                {
+                    int client_fd = accept4(tcp, nullptr, nullptr, SOCK_NONBLOCK);
+                    if(client_fd < 0)
+                    {
+                        if(errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        perror("accept");
+                        break;
+                    }
+                    Connection* conn = new Connection{client_fd};
+                    struct epoll_event cev{};
+                    cev.events = EPOLLIN;
+                    cev.data.ptr = conn;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
+                }
                 
             }
             else
@@ -202,42 +207,51 @@ int main() {
                 Connection* conn = (Connection*)events[i].data.ptr;
 
                 char temp[4096];
-                ssize_t n = read(conn->fd, temp, sizeof(temp));
+                bool done = false;
+                bool should_close = false;
 
-                if(n == 0)
+                while (true) 
+                {
+                    ssize_t n = read(conn->fd, temp, sizeof(temp));
+                    
+                    if (n > 0) 
+                        conn->buffer.insert(conn->buffer.end(), temp, temp + n);
+                        // continue, drain more
+                    else if (n == 0) 
+                    {
+                        should_close = true;  // peer closed
+                        break;
+                    }
+                    else 
+                    {  
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // drained
+                        if (errno == EINTR) continue;  // signal interrupted, retry
+                        should_close = true;  // real error
+                        break;
+                    }
+                }
+
+                if (should_close) 
+                {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                    close(conn->fd);
+                    delete conn;
+                    continue;  // skip to next event
+                }
+
+                // max headers check
+                if (conn->buffer.size() > MAX_HEADERS) 
                 {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
                     close(conn->fd);
                     delete conn;
                     continue;
                 }
-                if(n < 0)
-                {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
-                    close(conn->fd);
-                    delete conn;
-                    continue; 
-                }
 
-                conn->buffer.insert(conn->buffer.end(), temp, temp + n);
-                
-                if (conn->buffer.size() > MAX_HEADERS) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
-                    close(conn->fd);
-                    delete conn;
-                    continue;
-                }
-
-                if(memmem(conn->buffer.data(), conn->buffer.size(), "\r\n\r\n", 4))
-                {
+                // dispatch if request complete
+                if (memmem(conn->buffer.data(), conn->buffer.size(), "\r\n\r\n", 4)) 
                     handle_client(conn, epfd);
-
-                }
-                else
-                {
-                // headers not complete yet, wait for next epoll wakeup
-
-                }
+                
 
             }
         }
