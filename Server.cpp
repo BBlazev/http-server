@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <thread>
 #include <vector>
-//#include "ThreadPool.hpp"
+#include "ThreadPool.hpp"
 
 
 
@@ -52,12 +52,12 @@ const char* mime_type(const std::string& path)
 }
 
 
-void handle_client(Connection* conn, int epfd)
+void handle_client(Connection* conn)
 {
     // extract method
     char* method_end = (char*)memchr(conn->buffer.data(), ' ', conn->buffer.size());
     if (!method_end) {
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
         close(conn->fd);
         delete conn;
         return;
@@ -66,7 +66,7 @@ void handle_client(Connection* conn, int epfd)
     if (!(method_len == 3 && memcmp(conn->buffer.data(), "GET", 3) == 0)) {
         const char* resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
         write_all(conn->fd, resp, strlen(resp));
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
         close(conn->fd);
         delete conn;
         return;
@@ -77,7 +77,7 @@ void handle_client(Connection* conn, int epfd)
     size_t remaining = conn->buffer.size() - (path_start - conn->buffer.data());
     char* path_end = (char*)memchr(path_start, ' ', remaining);
     if (!path_end) {
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
         close(conn->fd);
         delete conn;
         return;
@@ -88,7 +88,7 @@ void handle_client(Connection* conn, int epfd)
     if (path.find("..") != std::string::npos) {
         const char* resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
         write_all(conn->fd, resp, strlen(resp));
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
         close(conn->fd);
         delete conn;
         return;
@@ -103,7 +103,7 @@ void handle_client(Connection* conn, int epfd)
         const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
         write_all(conn->fd, not_found, strlen(not_found));
         
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+        //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
         close(conn->fd);
         delete conn;
 
@@ -131,7 +131,7 @@ void handle_client(Connection* conn, int epfd)
 
     printf("Successfully served: %s\n", local_path.c_str());
     fflush(stdout);
-    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+    //epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
     close(conn->fd);
     delete conn;
     return;
@@ -139,7 +139,8 @@ void handle_client(Connection* conn, int epfd)
 
 
 int main() {
-    //ThreadPool pool(10);
+    //std::thread::hardware_concurrency();
+    ThreadPool pool(10);
     int tcp = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 
     if (tcp < 0) {
@@ -236,10 +237,9 @@ int main() {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
                     close(conn->fd);
                     delete conn;
-                    continue;  // skip to next event
+                    continue;  
                 }
 
-                // max headers check
                 if (conn->buffer.size() > MAX_HEADERS) 
                 {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
@@ -248,9 +248,17 @@ int main() {
                     continue;
                 }
 
-                // dispatch if request complete
-                if (memmem(conn->buffer.data(), conn->buffer.size(), "\r\n\r\n", 4)) 
-                    handle_client(conn, epfd);
+                //dispatch path?
+                if (memmem(conn->buffer.data(), conn->buffer.size(), "\r\n\r\n", 4))
+                {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                    pool.submit([conn]()
+                        {
+                            handle_client(conn);
+                        }
+                    );
+
+                } 
                 
 
             }
