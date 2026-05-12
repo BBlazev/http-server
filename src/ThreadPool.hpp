@@ -14,7 +14,7 @@ public:
     explicit ThreadPool(size_t num_workers);
     ~ThreadPool();
 
-    ThreadPool() = delete; // for clarity, compiler wont auto generate since we provided explicit const above
+    ThreadPool() = delete; // for clarity, compiler wont auto generate since we provided explicit construc above
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
